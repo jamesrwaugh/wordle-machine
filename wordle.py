@@ -49,11 +49,12 @@ def expected_information(p: float):
     return p * information(p)
 
 
-@dataclass
 class Engine:
-    possible_words: List[str]
+    def __init__(self, possible_words: List[str]):
+        self.possible_words = possible_words
+        self.current_filters: List[List[FilterFn]] = []
 
-    def get_word_filtersets(self, word: str) -> List[List[FilterFn]]:
+    def get_all_word_filtersets(self, word: str) -> List[List[FilterFn]]:
         filters_per_char: List[List[FilterFn]] = []
         seen_chars: Set[str] = set()
         for i, char in enumerate(word):
@@ -66,7 +67,7 @@ class Engine:
         return list(product(*filters_per_char))
 
     def entropy(self, guesses: List[str], word: str):
-        filter_sets = self.get_word_filtersets(word)
+        filter_sets = self.get_all_word_filtersets(word)
         word_sets = [self.narrow_guesses(guesses, filters)
                      for filters in filter_sets]
         entropy = sum(expected_information(len(word_set) / len(guesses))
@@ -85,22 +86,30 @@ class Engine:
                 new_matches.append(word)
         return new_matches
 
-    def step(self, word: str, filter_set: List[FilterFn]) -> StepResult:
-        new_possibilities = self.narrow_guesses(self.possible_words, filter_set)  # noqa
-        p = len(new_possibilities) / len(self.possible_words)
-        i = information(p)
-        e = self.entropy(self.possible_words, word)
+    def step(self, word: str, new_filter_set: List[FilterFn]) -> StepResult:
+        new_possibilities = self.narrow_guesses(self.possible_words, new_filter_set)  # noqa
+        prob = len(new_possibilities) / len(self.possible_words)
+        actual_info = information(prob)
+        expected_info = self.entropy(self.possible_words, word)
         self.possible_words = new_possibilities
+        self.current_filters.append(new_filter_set)
         return StepResult(
             new_possibilities=new_possibilities,
-            expected_information=e,
-            actual_information=i)
+            expected_information=expected_info,
+            actual_information=actual_info)
 
 
 def main():
     words: List[str] = json.load(open("guesses.json"))
     e = Engine(possible_words=words)
-    result = e.step("snake", [DoesNotHaveCharFilter("s")])
+    result = e.step(
+        "snake", [
+            HasCharInPosFilter("s", 0),
+            DoesNotHaveCharFilter("n"),
+            DoesNotHaveCharFilter("a"),
+            DoesNotHaveCharFilter("k"),
+            DoesNotHaveCharFilter("e")
+        ])
     print(result)
 
 
