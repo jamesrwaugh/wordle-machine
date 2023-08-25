@@ -1,8 +1,12 @@
+from collections import defaultdict
 from dataclasses import dataclass
 import json
-from typing import Callable, List, Set
+from typing import Callable, Dict, Iterable, List, Self, Set, Tuple
 from itertools import product
 from math import log2
+import string
+import time
+
 
 FilterFn = Callable[[str], bool]
 
@@ -14,6 +18,12 @@ class IncludeCharFilter:
     def __call__(self, candidate: str):
         return self.char in candidate
 
+    def __hash__(self) -> int:
+        return hash((self.char, "includes"))
+
+    def __eq__(self, __value: Self) -> bool:
+        return self.char == __value.char
+
 
 @dataclass
 class HasCharInPosFilter:
@@ -23,6 +33,12 @@ class HasCharInPosFilter:
     def __call__(self, candidate: str):
         return candidate[self.pos] == self.char
 
+    def __hash__(self) -> int:
+        return hash((self.char, self.pos, "haspos"))
+
+    def __eq__(self, __value: Self) -> bool:
+        return self.char == __value.char and self.pos == __value.pos
+
 
 @dataclass
 class DoesNotHaveCharFilter:
@@ -31,10 +47,16 @@ class DoesNotHaveCharFilter:
     def __call__(self, candidate: str):
         return self.char not in candidate
 
+    def __hash__(self) -> int:
+        return hash((self.char, "doesnot"))
+
+    def __eq__(self, __value: Self) -> bool:
+        return self.char == __value.char
+
 
 @dataclass
 class StepResult:
-    new_possibilities: List[str]
+    new_possibilities: Set[str]
     expected_information: float
     actual_information: float
 
@@ -51,10 +73,14 @@ def expected_information(p: float):
 
 class Engine:
     def __init__(self, possible_words: List[str]):
-        self.possible_words = possible_words
-        self.current_filters: List[List[FilterFn]] = []
+        self.init_guesses(possible_words)
+        self.current_filters: List[Tuple[FilterFn]] = []
 
-    def get_all_word_filtersets(self, word: str) -> List[List[FilterFn]]:
+    def init_guesses(self, guesses: Iterable[str]):
+        self.possible_words = set(guesses)
+        self.includeset_dict = self.build_includeset_dict()
+
+    def build_word_filtersets(self, word: str) -> Iterable[Tuple[FilterFn]]:
         filters_per_char: List[List[FilterFn]] = []
         seen_chars: Set[str] = set()
         for i, char in enumerate(word):
@@ -64,37 +90,60 @@ class Engine:
                 position_filters.append(IncludeCharFilter(char=char))
             seen_chars.add(char)
             filters_per_char.append(position_filters)
-        return list(product(*filters_per_char))
+        inner_product: Iterable[Tuple[FilterFn, ...]] = product(*filters_per_char)  # noqa
+        return inner_product
 
-    def entropy(self, guesses: List[str], word: str):
-        filter_sets = self.get_all_word_filtersets(word)
-        word_sets = [self.narrow_guesses(guesses, filters)
-                     for filters in filter_sets]
-        entropy = sum(expected_information(len(word_set) / len(guesses))
+    def build_word_includeset(self, word: str) -> Set[FilterFn]:
+        alphabet = set(string.ascii_lowercase)
+        filters_per_char: Set[FilterFn] = set()
+        word_alphabet = set(word)
+        seen_chars: Set[str] = set()
+        for i, char in enumerate(word):
+            filters_per_char.add(HasCharInPosFilter(char, i))
+            if not char in seen_chars:
+                filters_per_char.add(IncludeCharFilter(char))
+                seen_chars.add(char)
+        for missing_char in (alphabet - word_alphabet):
+            filters_per_char.add(DoesNotHaveCharFilter(missing_char))
+        return filters_per_char
+
+    def filter_current_guesses(self, filter_sets: Iterable[Tuple[FilterFn]]):
+        word_sets: List[Set[str]] = []
+        for filter_set in filter_sets:
+            partial_filtered_words = [self.includeset_dict[filter]
+                                      for filter in filter_set]
+            word_set = self.possible_words.intersection(*partial_filtered_words)  # noqa
+            word_sets.append(word_set)
+        return word_sets
+
+    def entropy(self, word: str):
+        filter_sets = self.build_word_filtersets(word)
+        word_sets = self.filter_current_guesses(filter_sets)
+        entropy = sum(expected_information(len(word_set) / len(self.possible_words))
                       for word_set in word_sets)
         return entropy
 
-    def narrow_guesses(self, possible_words: List[str], filters: List[FilterFn]):
-        new_matches: List[str] = []
-        for word in possible_words:
-            bad = False
-            for f in filters:
-                if not f(word):
-                    bad = True
-                    break
-            if not bad:
-                new_matches.append(word)
-        return new_matches
+    def build_includeset_dict(self):
+        all_filters: Dict[FilterFn, Set[str]] = defaultdict(set)
+        for word in self.possible_words:
+            include_sets = self.build_word_includeset(word)
+            for f in include_sets:
+                all_filters[f].add(word)
+        return all_filters
 
-    def step(self, word: str, new_filter_set: List[FilterFn]) -> StepResult:
-        new_possibilities = self.narrow_guesses(self.possible_words, new_filter_set)  # noqa
-        prob = len(new_possibilities) / len(self.possible_words)
-        actual_info = information(prob)
-        expected_info = self.entropy(self.possible_words, word)
-        self.possible_words = new_possibilities
+    def narrow_guesses(self, filters: Tuple[FilterFn]):
+        new_wordset = self.filter_current_guesses([filters])[0]
+        return new_wordset
+
+    def step(self, word: str, new_filter_set: Tuple[FilterFn, ...]) -> StepResult:
+        new_guesses = self.narrow_guesses(new_filter_set)
+        p = len(new_guesses) / len(self.possible_words)
+        actual_info = information(p)
+        expected_info = self.entropy(word)
+        self.init_guesses(new_guesses)
         self.current_filters.append(new_filter_set)
         return StepResult(
-            new_possibilities=new_possibilities,
+            new_possibilities=new_guesses,
             expected_information=expected_info,
             actual_information=actual_info)
 
@@ -102,15 +151,19 @@ class Engine:
 def main():
     words: List[str] = json.load(open("guesses.json"))
     e = Engine(possible_words=words)
+    start = time.time()
     result = e.step(
-        "snake", [
-            HasCharInPosFilter("s", 0),
+        "snake", (
+            DoesNotHaveCharFilter("s"),
             DoesNotHaveCharFilter("n"),
-            DoesNotHaveCharFilter("a"),
-            DoesNotHaveCharFilter("k"),
-            DoesNotHaveCharFilter("e")
-        ])
-    print(result)
+            HasCharInPosFilter("a", pos=2),
+            HasCharInPosFilter("k", pos=3),
+            HasCharInPosFilter("e", pos=4)
+        ))
+    end = time.time()
+    print((end - start))
+    print(result.actual_information, result.expected_information,
+          len(result.new_possibilities))
 
 
 main()
